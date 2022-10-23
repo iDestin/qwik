@@ -1,13 +1,14 @@
-import { styleContent, styleKey } from '../component/qrl-styles';
-import type { QRL } from '../import/qrl.public';
+import { styleContent, styleKey } from '../style/qrl-styles';
+import type { QRL } from '../qrl/qrl.public';
 import { implicit$FirstArg } from '../util/implicit_dollar';
 import { getScopedStyles } from '../style/scoped-stylesheet';
-import { getContext } from '../props/props';
 import { hasStyle } from '../render/execute-component';
 import { useSequentialScope } from './use-sequential-scope';
-import { assertQrl } from '../import/qrl-class';
+import { assertQrl } from '../qrl/qrl-class';
 import { isPromise } from '../util/promises';
-import { assertDefined } from '../assert/assert';
+import { assertDefined } from '../error/assert';
+import { getContext } from '../state/context';
+import { ComponentStylesPrefixContent } from '../util/markers';
 
 /**
  * @alpha
@@ -96,7 +97,7 @@ export const useStyles$ = /*#__PURE__*/ implicit$FirstArg(useStylesQrl);
 // </docs>
 export const useStylesScopedQrl = (styles: QRL<string>): UseStylesScoped => {
   return {
-    scopeId: _useStyles(styles, getScopedStyles, true),
+    scopeId: ComponentStylesPrefixContent + _useStyles(styles, getScopedStyles, true),
   };
 };
 

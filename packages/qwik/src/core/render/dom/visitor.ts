@@ -6,23 +6,16 @@ import {
   QSlotRef,
   QSlotS,
 } from '../../util/markers';
-import { cleanupContext, getContext, QContext, tryGetContext } from '../../props/props';
-import {
-  addQRLListener,
-  groupListeners,
-  isOnProp,
-  PREVENT_DEFAULT,
-  setEvent,
-} from '../../props/props-on';
+import { isOnProp, PREVENT_DEFAULT, setEvent } from '../../state/listeners';
 import type { ValueOrPromise } from '../../util/types';
 import { isPromise, promiseAll, promiseAllLazy, then } from '../../util/promises';
-import { assertDefined, assertEqual, assertTrue } from '../../assert/assert';
+import { assertDefined, assertEqual, assertTrue } from '../../error/assert';
 import { logWarn } from '../../util/log';
 import { qDev, qSerialize } from '../../util/qdev';
 import type { OnRenderFn } from '../../component/component.public';
 import { directGetAttribute, directSetAttribute } from '../fast-calls';
 import { SKIP_RENDER_TYPE } from '../jsx/jsx-runtime';
-import { assertQrl, isQrl } from '../../import/qrl-class';
+import { assertQrl, isQrl } from '../../qrl/qrl-class';
 import {
   assertElement,
   assertQwikElement,
@@ -38,10 +31,9 @@ import {
   pushRenderContext,
   serializeClass,
   setQId,
-  SKIPS_PROPS,
   stringifyStyle,
 } from '../execute-component';
-import { addQwikEvent, setRef, SubscriptionManager } from '../container';
+import { addQwikEvent, setRef } from '../../container/container';
 import {
   getRootNode,
   newVirtualElement,
@@ -67,20 +59,25 @@ import {
   setKey,
   setProperty,
 } from './operations';
-import { serializeQRLs } from '../../import/qrl';
 import { QOnce } from '../jsx/utils.public';
 import { EMPTY_OBJ } from '../../util/flyweight';
+import { addSignalSub, isSignal } from '../../state/signal';
 import {
-  addSignalSub,
-  createProxy,
-  getProxyManager,
-  getProxyTarget,
-  isSignal,
+  cleanupContext,
+  getContext,
+  HOST_FLAG_DIRTY,
+  HOST_FLAG_NEED_ATTACH_LISTENER,
+  QContext,
+  tryGetContext,
+} from '../../state/context';
+import { getProxyManager, getProxyTarget, SubscriptionManager } from '../../state/common';
+import { createProxy } from '../../state/store';
+import {
   QObjectFlagsSymbol,
   QObjectImmutable,
   _IMMUTABLE,
   _IMMUTABLE_PREFIX,
-} from '../../object/q-object';
+} from '../../state/constants';
 
 export const SVG_NS = 'http://www.w3.org/2000/svg';
 
@@ -424,7 +421,6 @@ export const patchVnode = (
   const props = newVnode.$props$;
   const isComponent = isVirtual && OnRenderProp in props;
   const elCtx = getContext(elm);
-  const containerState = staticCtx.$containerState$;
   assertDefined(currentComponent, 'slots can not be rendered outside a component', elm);
   if (!isComponent) {
     const pendingListeners = currentComponent.li;
@@ -439,16 +435,8 @@ export const patchVnode = (
       isSvg
     );
     if (pendingListeners.length > 0) {
-      addQRLListener(listeners, pendingListeners);
+      listeners.push(...pendingListeners);
       pendingListeners.length = 0;
-    }
-
-    if (qSerialize && listeners.length > 0) {
-      const groups = groupListeners(listeners);
-      for (const listener of groups) {
-        setAttribute(staticCtx, elm, listener[0], serializeQRLs(listener[1], elCtx));
-        addQwikEvent(listener[0], containerState);
-      }
     }
 
     if (isSvg && newVnode.$type$ === 'foreignObject') {
@@ -706,9 +694,9 @@ const createElm = (
         (elm as Element).classList.add(styleId);
       });
     }
-    if (currentComponent.$needAttachListeners$) {
-      addQRLListener(listeners, currentComponent.li);
-      currentComponent.$needAttachListeners$ = false;
+    if (currentComponent.$flags$ & HOST_FLAG_NEED_ATTACH_LISTENER) {
+      listeners.push(...currentComponent.li);
+      currentComponent.$flags$ &= ~HOST_FLAG_NEED_ATTACH_LISTENER;
     }
   }
 
@@ -720,21 +708,16 @@ const createElm = (
     directSetAttribute(elm, QSlotRef, currentComponent.$id$);
     currentComponent.$slots$.push(vnode);
     staticCtx.$addSlots$.push([elm, currentComponent.$element$]);
-  } else if (qSerialize) {
-    setKey(elm, vnode.$key$);
   }
 
   if (qSerialize) {
+    setKey(elm, vnode.$key$);
+
     if (isHead && !isVirtual) {
       directSetAttribute(elm as Element, 'q:head', '');
     }
     if (listeners.length > 0 || hasRef) {
       setQId(rCtx, elCtx);
-    }
-    const groups = groupListeners(listeners);
-    for (const listener of groups) {
-      setAttribute(staticCtx, elm, listener[0], serializeQRLs(listener[1], elCtx));
-      addQwikEvent(listener[0], staticCtx.$containerState$);
     }
   }
 
@@ -754,7 +737,7 @@ const createElm = (
   }
   const nodes = children.map((ch) => createElm(rCtx, ch, flags, promises));
   for (const node of nodes) {
-    appendChild(rCtx.$static$, elm, node);
+    directAppendChild(elm, node);
   }
   return elm;
 };
@@ -1057,7 +1040,7 @@ export const setComponentProps = (
     (expectProps as any)[_IMMUTABLE] ?? EMPTY_OBJ);
 
   for (const prop of keys) {
-    if (SKIPS_PROPS.includes(prop)) {
+    if (prop === 'children' || prop === QSlot) {
       continue;
     }
     if (isSignal(immutableMeta[prop])) {
@@ -1071,7 +1054,7 @@ export const setComponentProps = (
       }
     }
   }
-  return elCtx.$dirty$;
+  return !!(elCtx.$flags$ & HOST_FLAG_DIRTY);
 };
 
 export const cleanupTree = (
@@ -1150,12 +1133,10 @@ const browserSetEvent = (
 ) => {
   const containerState = staticCtx.$containerState$;
   const normalized = setEvent(elCtx.li, prop, input, containerState.$containerEl$);
-  if (!qSerialize) {
-    if (!prop.startsWith('on')) {
-      setAttribute(staticCtx, elCtx.$element$, normalized, '');
-    }
-    addQwikEvent(normalized, containerState);
+  if (!prop.startsWith('on')) {
+    setAttribute(staticCtx, elCtx.$element$, normalized, '');
   }
+  addQwikEvent(normalized, containerState);
 };
 
 const sameVnode = (vnode1: ProcessedJSXNode, vnode2: ProcessedJSXNode): boolean => {
